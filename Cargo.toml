@@ -1,0 +1,11 @@
+[package]
+name = "wasm-splice"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+leb128 = "0.2"
+sha2 = "0.10"
+wasm-encoder = "0.19"
+wasmparser = "0.94"
