@@ -6,7 +6,8 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
-use wasm_splice::{transform_custom_sections, write_section_header, ExternalSection, SpliceConfig};
+use wasm_splice::{transform_sections, write_section_header, ExternalSection, SpliceConfig};
+use wasmparser::Payload;
 
 fn main() -> Result<()> {
     let mut args = env::args_os();
@@ -27,13 +28,23 @@ fn main() -> Result<()> {
 
     let config = SpliceConfig::default();
 
-    transform_custom_sections(
+    transform_sections(
         input_path,
         &mut output,
-        |name| name == ExternalSection::CUSTOM_SECTION_NAME,
-        |reader, mut output| {
+        |payload| match payload {
+            Payload::UnknownSection { id, range, .. } if id == &ExternalSection::SECTION_ID => {
+                Some(range.clone())
+            }
+            _ => None,
+        },
+        |payload, mut output| {
+            let Payload::UnknownSection { contents, .. } = payload else {
+                unreachable!("Payload type changed?");
+            };
+
+            // Deserialize external section
             let external =
-                ExternalSection::from_custom_section(reader).context("invalid external section")?;
+                ExternalSection::from_bytes(contents).context("invalid external section")?;
             eprintln!("Found external section: {external:#?}\n");
 
             // Check digest algo
@@ -47,7 +58,7 @@ fn main() -> Result<()> {
 
             // Write section header
             let payload_size = external.prefix.len() + external.external_size as usize;
-            write_section_header(&mut output, external.section_id, payload_size)
+            write_section_header(&mut output, external.external_section_id, payload_size)
                 .context("failed to write section header")?;
 
             // Write prefix

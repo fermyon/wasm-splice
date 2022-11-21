@@ -1,12 +1,13 @@
 use std::{
     fmt,
     io::Write,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
 use anyhow::{ensure, Context, Result};
-use wasm_encoder::{Encode, SectionId};
-use wasmparser::{BinaryReader, CustomSectionReader, Parser, Payload};
+use wasm_encoder::Encode;
+use wasmparser::{BinaryReader, Parser, Payload};
 
 pub struct SpliceConfig {
     external_section_dir: PathBuf,
@@ -32,11 +33,12 @@ impl Default for SpliceConfig {
     }
 }
 
-pub fn transform_custom_sections<Output: Write>(
+pub fn transform_sections<Output: Write>(
     input_path: impl AsRef<Path>,
     output: &mut Output,
-    will_transform: impl Fn(&str) -> bool,
-    transform: impl Fn(CustomSectionReader, &mut Output) -> Result<()>,
+    // Return Some(section_data_range) iff section should be transformed
+    will_transform: impl Fn(&Payload) -> Option<Range<usize>>,
+    transform: impl Fn(Payload, &mut Output) -> Result<()>,
 ) -> Result<()> {
     // Input file
     let input_path = input_path.as_ref();
@@ -44,22 +46,20 @@ pub fn transform_custom_sections<Output: Write>(
         std::fs::read(input_path).with_context(|| format!("Couldn't read input {input_path:?}"))?;
 
     let mut consumed = 0;
-    for payload in Parser::new(0).parse_all(&input) {
-        if let Payload::CustomSection(reader) = payload? {
-            if will_transform(reader.name()) {
-                // Copy up to the beginning of this section to output
-                // FIXME: This is terrible; probably shouldn't use Parser::parse_all
-                let section_size_len =
-                    leb128::write::unsigned(&mut std::io::sink(), reader.range().len() as u64)
-                        .unwrap();
-                let section_start = reader.range().start - 1 - section_size_len;
-                output.write_all(&input[consumed..section_start])?;
-                consumed = reader.range().end;
+    for payload_res in Parser::new(0).parse_all(&input) {
+        let payload = payload_res?;
+        if let Some(data_range) = will_transform(&payload) {
+            // Copy up to the beginning of this section to output
+            // FIXME: This is terrible; probably shouldn't use Parser::parse_all
+            let section_size_len =
+                leb128::write::unsigned(&mut std::io::sink(), data_range.len() as u64).unwrap();
+            let section_start = data_range.start - 1 - section_size_len;
+            output.write_all(&input[consumed..section_start])?;
+            consumed = data_range.end;
 
-                // Run transform
-                transform(reader, output)?;
-            }
-        };
+            // Run transform
+            transform(payload, output)?;
+        }
     }
 
     // Write the remainder to output
@@ -69,7 +69,7 @@ pub fn transform_custom_sections<Output: Write>(
 }
 
 pub struct ExternalSection<'a> {
-    pub section_id: u8,
+    pub external_section_id: u8,
     pub prefix: &'a [u8],
     pub external_size: u32,
     pub digest_algo: &'a str,
@@ -77,12 +77,12 @@ pub struct ExternalSection<'a> {
 }
 
 impl<'a> ExternalSection<'a> {
-    pub const CUSTOM_SECTION_NAME: &str = "@external-section";
+    pub const SECTION_ID: u8 = 0x5E; // 5ection External
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(512);
 
-        data.push(self.section_id);
+        data.push(self.external_section_id);
         self.prefix.encode(&mut data);
         self.external_size.encode(&mut data);
         self.digest_algo.encode(&mut data);
@@ -91,17 +91,12 @@ impl<'a> ExternalSection<'a> {
         data
     }
 
-    pub fn write_custom_section(&self, mut writer: impl Write) -> std::io::Result<usize> {
-        let mut name_bytes = vec![];
-        Self::CUSTOM_SECTION_NAME.encode(&mut name_bytes);
+    pub fn write_section(&self, mut writer: impl Write) -> std::io::Result<usize> {
         let section_data = self.to_bytes();
-        let payload_size = name_bytes.len() + section_data.len();
-
-        let header_len = write_section_header(&mut writer, SectionId::Custom as u8, payload_size)?;
-        writer.write_all(&name_bytes)?;
+        let header_len = write_section_header(&mut writer, Self::SECTION_ID, section_data.len())?;
         writer.write_all(&section_data)?;
 
-        Ok(header_len + payload_size)
+        Ok(header_len + section_data.len())
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<ExternalSection> {
@@ -116,27 +111,19 @@ impl<'a> ExternalSection<'a> {
         ensure!(reader.eof(), "unexpected trailing data");
 
         Ok(ExternalSection {
-            section_id,
+            external_section_id: section_id,
             prefix,
             external_size,
             digest_algo,
             digest_data,
         })
     }
-
-    pub fn from_custom_section(section: CustomSectionReader) -> Result<ExternalSection> {
-        ensure!(
-            section.name() == Self::CUSTOM_SECTION_NAME,
-            "not an external section!"
-        );
-        Self::from_bytes(section.data())
-    }
 }
 
 impl<'a> fmt::Debug for ExternalSection<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExternalSection")
-            .field("section_id", &self.section_id)
+            .field("section_id", &self.external_section_id)
             .field("prefix", &self.prefix.escape_ascii().to_string())
             .field("external_size", &self.external_size)
             .field("digest_algo", &self.digest_algo)

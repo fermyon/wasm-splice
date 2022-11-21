@@ -3,7 +3,8 @@ use std::{env, fs::File, path::PathBuf};
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use wasm_encoder::{Encode, SectionId};
-use wasm_splice::{transform_custom_sections, ExternalSection, SpliceConfig};
+use wasm_splice::{transform_sections, ExternalSection, SpliceConfig};
+use wasmparser::Payload;
 
 fn main() -> Result<()> {
     let mut args = env::args_os();
@@ -39,11 +40,20 @@ fn main() -> Result<()> {
 
     let config = SpliceConfig::default();
 
-    transform_custom_sections(
+    transform_sections(
         input_path,
         &mut output,
-        |name| custom_section_names.contains(&name),
-        |reader, output| {
+        |payload| match payload {
+            Payload::CustomSection(reader) if custom_section_names.contains(&reader.name()) => {
+                Some(reader.range())
+            }
+            _ => None,
+        },
+        |payload, output| {
+            let Payload::CustomSection(reader) = payload else {
+                unreachable!("Payload type changed?");
+            };
+
             eprintln!("Matched custom section {:?}", reader.name());
 
             // Calculate digest of section content
@@ -59,13 +69,13 @@ fn main() -> Result<()> {
             let mut prefix = vec![];
             reader.name().encode(&mut prefix);
             let external = ExternalSection {
-                section_id: SectionId::Custom as u8,
+                external_section_id: SectionId::Custom as u8,
                 prefix: &prefix,
                 external_size: reader.data().len() as u32,
                 digest_algo: "sha256",
                 digest_data: digest.as_slice(),
             };
-            external.write_custom_section(output)?;
+            external.write_section(output)?;
             eprintln!("Split external section: {external:#?}");
 
             eprintln!();
