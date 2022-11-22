@@ -1,9 +1,9 @@
-use std::{env, fs::File, path::PathBuf};
+use std::{env, fs::File, io::Write, path::PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use wasm_encoder::{Encode, SectionId};
-use wasm_splice::{transform_sections, ExternalSection, SpliceConfig};
+use wasm_splice::{transform_sections, ExternalSection, SpliceConfig, EXTERNAL_SECTION_LAYER_BIT};
 use wasmparser::Payload;
 
 fn main() -> Result<()> {
@@ -15,8 +15,10 @@ fn main() -> Result<()> {
         arg0.to_string_lossy()
     );
 
-    // Input path
+    // Input
     let input_path: PathBuf = args.next().unwrap().into();
+    let input = std::fs::read(&input_path)
+        .with_context(|| format!("Couldn't read input {input_path:?}"))?;
 
     // Section spec(s)
     let section_specs = args
@@ -41,44 +43,57 @@ fn main() -> Result<()> {
     let config = SpliceConfig::default();
 
     transform_sections(
-        input_path,
+        &input,
         &mut output,
         |payload| match payload {
-            Payload::CustomSection(reader) if custom_section_names.contains(&reader.name()) => {
-                Some(reader.range())
-            }
-            _ => None,
+            Payload::Version { range, .. } => range.start == 0,
+            Payload::CustomSection(reader) => custom_section_names.contains(&reader.name()),
+            _ => false,
         },
         |payload, output| {
-            let Payload::CustomSection(reader) = payload else {
-                unreachable!("Payload type changed?");
+            match payload {
+                Payload::Version { num, .. } => {
+                    // Update the layer field of the version to one of the "uses external sections"
+                    // layers by setting the appropriate bit. OK if already set.
+                    let new_version = num | EXTERNAL_SECTION_LAYER_BIT;
+
+                    // Write updated preamble to output
+                    let mut preamble = b"\0asm".to_vec();
+                    preamble.extend(new_version.to_le_bytes());
+                    output.write_all(&preamble)?;
+                }
+
+                Payload::CustomSection(reader) => {
+                    eprintln!("Matched custom section {:?}", reader.name());
+
+                    // Calculate digest of section content
+                    let digest = Sha256::digest(reader.data());
+
+                    // Write section content to external section file
+                    let path = config.external_section_path(digest)?;
+                    std::fs::write(&path, reader.data()).with_context(|| {
+                        format!("failed to write section content file {path:?}")
+                    })?;
+                    eprintln!("Wrote external section data to {path:?}");
+
+                    // Write external section to output
+                    let mut prefix = vec![];
+                    reader.name().encode(&mut prefix);
+                    let external = ExternalSection {
+                        external_section_id: SectionId::Custom as u8,
+                        prefix: &prefix,
+                        external_size: reader.data().len() as u32,
+                        digest_algo: "sha256",
+                        digest_data: digest.as_slice(),
+                    };
+                    external.write_section(output)?;
+                    eprintln!("Split external section: {external:#?}");
+
+                    eprintln!();
+                }
+
+                _ => panic!("unexpected payload type: {payload:?}"),
             };
-
-            eprintln!("Matched custom section {:?}", reader.name());
-
-            // Calculate digest of section content
-            let digest = Sha256::digest(reader.data());
-
-            // Write section content to external section file
-            let path = config.external_section_path(digest)?;
-            std::fs::write(&path, reader.data())
-                .with_context(|| format!("failed to write section content file {path:?}"))?;
-            eprintln!("Wrote external section data to {path:?}");
-
-            // Write external section to output
-            let mut prefix = vec![];
-            reader.name().encode(&mut prefix);
-            let external = ExternalSection {
-                external_section_id: SectionId::Custom as u8,
-                prefix: &prefix,
-                external_size: reader.data().len() as u32,
-                digest_algo: "sha256",
-                digest_data: digest.as_slice(),
-            };
-            external.write_section(output)?;
-            eprintln!("Split external section: {external:#?}");
-
-            eprintln!();
             Ok(())
         },
     )?;

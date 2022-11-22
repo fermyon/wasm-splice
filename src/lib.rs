@@ -1,13 +1,13 @@
-use std::{
-    fmt,
-    io::Write,
-    ops::Range,
-    path::{Path, PathBuf},
-};
+use std::{fmt, io::Write, path::PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use wasm_encoder::Encode;
 use wasmparser::{BinaryReader, Parser, Payload};
+
+// This is effectively a "uses external sections" feature flag, using the
+// "layer" field described here:
+// https://github.com/WebAssembly/component-model/blob/ded219eff2f3ac8aabd34137fbda8eef18ab583b/design/mvp/Binary.md
+pub const EXTERNAL_SECTION_LAYER_BIT: u32 = 0x00020000;
 
 pub struct SpliceConfig {
     external_section_dir: PathBuf,
@@ -34,28 +34,36 @@ impl Default for SpliceConfig {
 }
 
 pub fn transform_sections<Output: Write>(
-    input_path: impl AsRef<Path>,
+    input: &[u8],
     output: &mut Output,
-    // Return Some(section_data_range) iff section should be transformed
-    will_transform: impl Fn(&Payload) -> Option<Range<usize>>,
+    // Return Some(section_start_offset) iff section should be transformed
+    will_transform: impl Fn(&Payload) -> bool,
     transform: impl Fn(Payload, &mut Output) -> Result<()>,
 ) -> Result<()> {
     // Input file
-    let input_path = input_path.as_ref();
-    let input =
-        std::fs::read(input_path).with_context(|| format!("Couldn't read input {input_path:?}"))?;
-
     let mut consumed = 0;
-    for payload_res in Parser::new(0).parse_all(&input) {
+    for payload_res in Parser::new(0).parse_all(input) {
         let payload = payload_res?;
-        if let Some(data_range) = will_transform(&payload) {
+        if will_transform(&payload) {
+            let payload_range = if let Some((_, mut range)) = payload.as_section() {
+                // The Range returned by Payload::as_section does not include
+                // the section ID or (variable width) size, so calculate them.
+                // FIXME: kinda terrible; patch wasmparser or don't use parse_all?
+                let section_size_len =
+                    leb128::write::unsigned(&mut std::io::sink(), range.len() as u64).unwrap();
+                // From start of section data, subtract lengths of ID and section size
+                range.start -= 1 + section_size_len;
+                range
+            } else if let Payload::Version { range, .. } = &payload {
+                // Version range *does* cover the entire header
+                range.clone()
+            } else {
+                unimplemented!("transform_sections cannot transform {payload:?}");
+            };
+
             // Copy up to the beginning of this section to output
-            // FIXME: This is terrible; probably shouldn't use Parser::parse_all
-            let section_size_len =
-                leb128::write::unsigned(&mut std::io::sink(), data_range.len() as u64).unwrap();
-            let section_start = data_range.start - 1 - section_size_len;
-            output.write_all(&input[consumed..section_start])?;
-            consumed = data_range.end;
+            output.write_all(&input[consumed..payload_range.start])?;
+            consumed = payload_range.end;
 
             // Run transform
             transform(payload, output)?;

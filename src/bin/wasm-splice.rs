@@ -6,7 +6,10 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
-use wasm_splice::{transform_sections, write_section_header, ExternalSection, SpliceConfig};
+use wasm_splice::{
+    transform_sections, write_section_header, ExternalSection, SpliceConfig,
+    EXTERNAL_SECTION_LAYER_BIT,
+};
 use wasmparser::Payload;
 
 fn main() -> Result<()> {
@@ -18,8 +21,25 @@ fn main() -> Result<()> {
         arg0.to_string_lossy()
     );
 
-    // Input path
+    // Input
     let input_path: PathBuf = args.next().unwrap().into();
+    let mut input = std::fs::read(&input_path)
+        .with_context(|| format!("Couldn't read input {input_path:?}"))?;
+    ensure!(input.len() > 8, "input too small ({} bytes)", input.len());
+
+    // Validate that the input preamble has a "uses external sections" layer,
+    // then unset that bit so wasmparser won't throw a fit.
+    // FIXME: Update wasmparser to accept these layers
+    {
+        let version_slice = &mut input[4..8];
+        let version = u32::from_le_bytes(version_slice.try_into().unwrap());
+        let new_version = version & !EXTERNAL_SECTION_LAYER_BIT;
+        ensure!(
+            version != new_version,
+            "input doesn't use external sections; version = {version:#x}"
+        );
+        version_slice.clone_from_slice(&new_version.to_le_bytes());
+    }
 
     // Output file
     let output_path = input_path.with_extension("wasm-spliced");
@@ -29,13 +49,11 @@ fn main() -> Result<()> {
     let config = SpliceConfig::default();
 
     transform_sections(
-        input_path,
+        &input,
         &mut output,
         |payload| match payload {
-            Payload::UnknownSection { id, range, .. } if id == &ExternalSection::SECTION_ID => {
-                Some(range.clone())
-            }
-            _ => None,
+            Payload::UnknownSection { id, .. } => id == &ExternalSection::SECTION_ID,
+            _ => false,
         },
         |payload, mut output| {
             let Payload::UnknownSection { contents, .. } = payload else {
